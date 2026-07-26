@@ -1,4 +1,5 @@
 import cv2
+import os
 import numpy as np
 import rclpy
 import tensorrt as trt
@@ -19,12 +20,17 @@ class HumanSLAMNode(Node):
     ROS 2 wrapper for the HumanSLAM semantic recovery model.
 
     This node:
-        1. receives keyframe images
+        1. receives keyframe images, currently normal Image messages
         2. runs scene / YOLO segmentation / OCR processing
         3. builds KeyframeRecord objects
         4. calls CognitiveMathModel
         5. selects a semantic candidate keyframe
 
+    Later, this can subscribe to a custom ORB-SLAM3 keyframe message that includes:
+        - keyframe id
+        - tracking inliers
+        - pose
+        - BoW / keyframe metadata
     """
 
     def __init__(self):
@@ -73,11 +79,11 @@ class HumanSLAMNode(Node):
     def _declare_parameters(self):
         self.declare_parameter("camera_source", "/camera/image_raw")
 
-        self.declare_parameter("scene_classifier_path", "")
+        self.declare_parameter("scene_classifier_path", "/home/teleopbike/Documents/Mayowa/ros2_ws/src/slam/slam/weights/resnet50_places365.engine")
         self.declare_parameter("scene_classifier_threshold", 0.5)
         self.declare_parameter("scene_embedding_dim", 512)
 
-        self.declare_parameter("yolo_model_path", "")
+        self.declare_parameter("yolo_model_path", "/home/teleopbike/Documents/Mayowa/ros2_ws/src/slam/slam/weights/yolo26n-seg.engine")
         self.declare_parameter("yolo_confidence_threshold", 0.5)
 
         self.declare_parameter("ocr_confidence_threshold", 0.5)
@@ -86,7 +92,7 @@ class HumanSLAMNode(Node):
         self.declare_parameter("ocr_use_angle_cls", True)
         self.declare_parameter("ocr_show_log", False)
 
-        self.declare_parameter("stable_classes", [])
+        self.declare_parameter("stable_classes", ["traffic light","stop sign","parking meter","bench","chair","tv","laptop","book","clock"])
         self.declare_parameter("crop_margin", 10)
         self.declare_parameter("isolate_mask_for_ocr", True)
 
@@ -119,6 +125,7 @@ class HumanSLAMNode(Node):
         self.ocr_show_log = bool(self.get_parameter("ocr_show_log").value)
 
         self.stable_classes = list(self.get_parameter("stable_classes").value)
+        self.get_logger().info(f"Loaded stable_classes: {self.stable_classes}")
         self.crop_margin = int(self.get_parameter("crop_margin").value)
         self.isolate_mask_for_ocr = bool(self.get_parameter("isolate_mask_for_ocr").value)
 
@@ -162,11 +169,15 @@ class HumanSLAMNode(Node):
         self.get_logger().info(f"YOLO class names: {self.yolo.names}")
 
         self.ocr_model = PaddleOCR(
-            use_angle_cls=self.ocr_use_angle_cls,
-            lang=self.ocr_language,
-            use_gpu=self.ocr_use_gpu,
-            show_log=self.ocr_show_log,
-        )
+        lang=self.ocr_language,
+        device="cpu",
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        enable_mkldnn=False,
+    )
         self.get_logger().info("PaddleOCR model loaded")
 
     def load_scene_engine_once(self, engine_path):
@@ -298,6 +309,7 @@ class HumanSLAMNode(Node):
             verbose=False,
         )
 
+        
         for result in yolo_results:
             boxes = result.boxes
             masks = result.masks
@@ -310,8 +322,10 @@ class HumanSLAMNode(Node):
                 confidence = float(box.conf[0])
                 class_name = self.yolo.names[class_id]
 
+            
                 if confidence < self.yolo_conf:
                     continue
+                    
 
                 if self.stable_classes and class_name not in self.stable_classes:
                     continue
@@ -383,7 +397,8 @@ class HumanSLAMNode(Node):
         detected_texts = []
 
         try:
-            ocr_results = self.ocr_model.ocr(crop, cls=True)
+            # Use file path because you already confirmed this works outside ROS
+            ocr_results = self.ocr_model.predict(crop)
         except Exception as exc:
             self.get_logger().warn(f"OCR failed on {class_name}: {exc}")
             return detected_texts
@@ -391,19 +406,48 @@ class HumanSLAMNode(Node):
         if ocr_results is None:
             return detected_texts
 
-        for line_group in ocr_results:
-            if line_group is None:
+        for result in ocr_results:
+
+            # PaddleOCR v3 may return a dict directly
+            if isinstance(result, dict):
+                result_dict = result
+
+            # Or it may return an object with json/to_dict
+            else:
+                result_dict = None
+
+                if hasattr(result, "json"):
+                    result_dict = result.json
+                    if callable(result_dict):
+                        result_dict = result_dict()
+
+                elif hasattr(result, "to_dict"):
+                    result_dict = result.to_dict()
+                    if callable(result_dict):
+                        result_dict = result_dict()
+
+            if result_dict is None:
+                self.get_logger().warn(f"Could not parse OCR result: {result}")
                 continue
 
-            for line in line_group:
-                try:
-                    text = str(line[1][0])
-                    confidence = float(line[1][1])
-                except Exception:
-                    continue
+            # Your successful output has rec_texts directly at the top level
+            rec_texts = result_dict.get("rec_texts", [])
+            rec_scores = result_dict.get("rec_scores", [])
+
+            self.get_logger().info(f"Parsed OCR texts: {rec_texts}")
+            self.get_logger().info(f"Parsed OCR scores: {rec_scores}")
+
+            for text, confidence in zip(rec_texts, rec_scores):
+                confidence = float(confidence)
 
                 if confidence >= self.ocr_conf:
-                    detected_texts.append(TextAnchor(text=text, conf=confidence))
+                    detected_texts.append(
+                        TextAnchor(
+                            text=str(text),
+                            conf=confidence,
+                        )
+                    )
+
                     self.get_logger().info(
                         f"OCR on {class_name}: '{text}', conf={confidence:.2f}"
                     )
