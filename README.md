@@ -112,7 +112,8 @@ ros2_ws/
 
 The integrated system also needs:
 
-- the modified ORB-SLAM3 core;
+- the
+  [HumanSLAM-modified ORB-SLAM3 core](https://github.com/Mayowa2024/HUMAN_SLAM_MODIFIED_ORB_SLAM3);
 - the `orbslam3_zed_stereo` ROS 2 wrapper; and
 - the `human_slam_interfaces` message package.
 
