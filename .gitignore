@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ROS/colcon generated output
+build/
+install/
+log/
+results/
+
+# Local IDE/tool state
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Local links to separately managed ORB-SLAM3 repositories
+external/
+
+# Private author notes and generated dissertation binary
+docs/DEFENCE_MANUAL_PRIVATE.md
+docs/METHODOLOGY.docx
+tools/generate_methodology_docx.py
+
+# Hardware/runtime-specific model artefacts
+weights/*.engine
+weights/*.onnx

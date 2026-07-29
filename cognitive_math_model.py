@@ -35,6 +35,10 @@ class CognitiveMathModel:
         lambda_area: float = 1.0,
         text_geom_threshold: float = 0.6,
         semantic_threshold: float = 0.75,
+        use_scene: bool = True,
+        use_object: bool = True,
+        use_text: bool = True,
+        text_conflict_floor: float = 0.25,
     ) -> None:
         self.w_scene = float(w_scene)
         self.w_object = float(w_object)
@@ -44,6 +48,15 @@ class CognitiveMathModel:
         self.lambda_area = float(lambda_area)
         self.text_geom_threshold = float(text_geom_threshold)
         self.semantic_threshold = float(semantic_threshold)
+        self.use_scene = bool(use_scene)
+        self.use_object = bool(use_object)
+        self.use_text = bool(use_text)
+        self.text_conflict_floor = self._clamp(
+            text_conflict_floor, 0.0, 1.0
+        )
+
+        if not any((self.use_scene, self.use_object, self.use_text)):
+            raise ValueError("At least one cognitive layer must be enabled")
 
     # ------------------------------------------------------------------
     # Layer 1: Scene sequence similarity
@@ -93,11 +106,10 @@ class CognitiveMathModel:
             feature_sim = float(np.dot(q_emb, c_emb))
             feature_sim = self._clamp(feature_sim, 0.0, 1.0)
 
-            conf_weight = self._clamp(q_scene.confidence, 0.0, 1.0) * self._clamp(
-                c_scene.confidence, 0.0, 1.0
-            )
-
-            score += float(weights[idx]) * feature_sim * conf_weight
+            # Classifier confidence describes certainty in the scene label; it
+            # is not the reliability of the retrieval embedding. Multiplying
+            # two confidences previously suppressed even identical places.
+            score += float(weights[idx]) * feature_sim
 
         return self._clamp(float(score), 0.0, 1.0)
 
@@ -202,7 +214,7 @@ class CognitiveMathModel:
         if len(q_obj.texts) == 0 or len(c_obj.texts) == 0:
             return 0.0
 
-        best_scores = []
+        weighted_scores = []
 
         for q_text in q_obj.texts:
             best = 0.0
@@ -214,15 +226,24 @@ class CognitiveMathModel:
 
                 best = max(best, s_str * q_conf * c_conf)
 
-            best_scores.append(best)
+            weight = max(self.text_distinctiveness(q_text.text), 0.05)
+            weighted_scores.append((weight, best))
 
-        return self._clamp(float(np.mean(best_scores)), 0.0, 1.0)
+        denominator = sum(weight for weight, _ in weighted_scores)
+        if denominator <= 0.0:
+            return 0.0
+        return self._clamp(
+            sum(weight * score for weight, score in weighted_scores)
+            / denominator,
+            0.0,
+            1.0,
+        )
 
     def text_similarity(
         self,
         query_keyframe: KeyframeRecord,
         candidate_keyframe: KeyframeRecord,
-    ) -> Tuple[float, int]:
+    ) -> Tuple[float, float]:
         """
         Computes S_text and gamma_T.
 
@@ -249,7 +270,25 @@ class CognitiveMathModel:
 
             best_scores.append(best)
 
-        return self._clamp(float(np.mean(best_scores)), 0.0, 1.0), 1
+        raw_score = self._clamp(float(np.mean(best_scores)), 0.0, 1.0)
+        bounded_score = self.text_conflict_floor + (
+            1.0 - self.text_conflict_floor
+        ) * raw_score
+        query_strength = float(np.mean([
+            self.text_distinctiveness(text.text)
+            for obj in q_text_objects
+            for text in obj.texts
+        ]))
+        candidate_strength = float(np.mean([
+            self.text_distinctiveness(text.text)
+            for obj in c_text_objects
+            for text in obj.texts
+        ]))
+        evidence_strength = math.sqrt(query_strength * candidate_strength)
+        return (
+            self._clamp(bounded_score, 0.0, 1.0),
+            self._clamp(evidence_strength, 0.0, 1.0),
+        )
 
     def string_similarity(self, a: str, b: str) -> float:
         """
@@ -266,9 +305,51 @@ class CognitiveMathModel:
 
         dist = self._levenshtein_distance(a, b)
         denom = max(len(a), len(b), 1)
-        score = 1.0 - (dist / denom)
+        edit_score = 1.0 - (dist / denom)
 
-        return self._clamp(score, 0.0, 1.0)
+        tokens_a = set(a.split())
+        tokens_b = set(b.split())
+        token_union = tokens_a | tokens_b
+        token_score = (
+            len(tokens_a & tokens_b) / len(token_union)
+            if token_union
+            else 0.0
+        )
+        compact_a = a.replace(" ", "")
+        compact_b = b.replace(" ", "")
+        containment_score = 0.0
+        if min(len(compact_a), len(compact_b)) >= 4 and (
+            compact_a in compact_b or compact_b in compact_a
+        ):
+            containment_score = (
+                min(len(compact_a), len(compact_b))
+                / max(len(compact_a), len(compact_b))
+            )
+
+        return self._clamp(
+            max(edit_score, token_score, containment_score), 0.0, 1.0
+        )
+
+    def text_distinctiveness(self, text: str) -> float:
+        cleaned = self._clean_text(text)
+        compact = cleaned.replace(" ", "")
+        if not compact:
+            return 0.0
+
+        common = {
+            "exit", "open", "closed", "stop", "road", "street",
+            "shop", "store", "parking", "welcome",
+        }
+        length_score = min(1.0, len(compact) / 8.0)
+        digit_bonus = (
+            0.15 if any(character.isdigit() for character in compact) else 0.0
+        )
+        common_factor = 0.35 if cleaned in common else 1.0
+        return self._clamp(
+            (0.2 + 0.8 * length_score + digit_bonus) * common_factor,
+            0.0,
+            1.0,
+        )
 
     # ------------------------------------------------------------------
     # Unified score and candidate selection
@@ -288,23 +369,48 @@ class CognitiveMathModel:
         Objects and text use only current query keyframe vs candidate keyframe.
         """
 
-        s_scene = self.scene_similarity(query_scene_seq, candidate_scene_seq)
-        s_obj = self.object_similarity(query_keyframe, candidate_keyframe)
-        s_text, gamma_t = self.text_similarity(query_keyframe, candidate_keyframe)
+        weighted_scores = []
 
-        if gamma_t == 1:
-            score = (
-                self.w_scene * s_scene
-                + self.w_object * s_obj
-                + self.w_text * s_text
+        scene_available = (
+            bool(query_scene_seq)
+            and bool(candidate_scene_seq)
+            and any(item is not None and item.embedding is not None
+                    for item in query_scene_seq)
+            and any(item is not None and item.embedding is not None
+                    for item in candidate_scene_seq)
+        )
+        if self.use_scene and self.w_scene > 0.0 and scene_available:
+            weighted_scores.append(
+                (self.w_scene, self.scene_similarity(
+                    query_scene_seq, candidate_scene_seq
+                ))
             )
-        else:
-            denom = self.w_scene + self.w_object
 
-            if denom <= 0.0:
-                return 0.0
+        object_available = (
+            bool(query_keyframe.static_objects)
+            and bool(candidate_keyframe.static_objects)
+        )
+        if self.use_object and self.w_object > 0.0 and object_available:
+            weighted_scores.append(
+                (self.w_object, self.object_similarity(
+                    query_keyframe, candidate_keyframe
+                ))
+            )
 
-            score = (self.w_scene * s_scene + self.w_object * s_obj) / denom
+        if self.use_text and self.w_text > 0.0:
+            s_text, gamma_t = self.text_similarity(
+                query_keyframe, candidate_keyframe
+            )
+            if gamma_t > 0.0:
+                weighted_scores.append((self.w_text * gamma_t, s_text))
+
+        denominator = sum(weight for weight, _ in weighted_scores)
+        if denominator <= 0.0:
+            return 0.0
+
+        score = sum(
+            weight * layer_score for weight, layer_score in weighted_scores
+        ) / denominator
 
         return self._clamp(float(score), 0.0, 1.0)
 

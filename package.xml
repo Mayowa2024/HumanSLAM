@@ -2,15 +2,20 @@
 <package format="3">
   <name>slam</name>
   <version>0.0.0</version>
-  <description>HumanSLAM semantic-contextual recovery node</description>
-  <maintainer email="mayowa@example.com">mayowa</maintainer>
-  <license>TODO</license>
+  <description>HumanSLAM semantic retrieval, relocalisation and map-fusion assistance for ORB-SLAM3.</description>
+  <maintainer email="samadebambo@gmail.com">Mayowa Adebambo</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>human_slam_interfaces</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -67,4 +67,5 @@ class KeyframeRecord:
     # Optional pose/local map references from ORB-SLAM3.
     pose: Optional[np.ndarray] = None
     orb_keyframe_id: Optional[int] = None
+    orb_map_id: Optional[int] = None
     tracking_inliers: Optional[int] = None
