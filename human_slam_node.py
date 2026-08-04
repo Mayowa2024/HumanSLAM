@@ -1,13 +1,16 @@
+import csv
 import cv2
 import numpy as np
 import rclpy
 import tensorrt as trt
 import threading
+import time
 
 from collections import deque
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose
 from human_slam_interfaces.msg import OrbSlamFrame, SemanticCandidates
+from pathlib import Path
 from queue import Empty, Full, Queue
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -15,6 +18,7 @@ from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
 from slam.cognitive_math_model import CognitiveMathModel
+from slam.scene_categories import group_places365_probabilities
 from slam.types import KeyframeRecord, SceneRecord, StaticObject, TextAnchor
 
 
@@ -63,6 +67,8 @@ class HumanSLAMNode(Node):
             use_object=self.use_object,
             use_text=self.use_text,
             text_conflict_floor=self.text_conflict_floor,
+            use_scene_category=self.use_scene_category,
+            scene_category_weight=self.scene_category_weight,
         )
 
         self.get_logger().info("HumanSLAM node initialising")
@@ -129,8 +135,11 @@ class HumanSLAMNode(Node):
         self.declare_parameter("scene_embedding_output", "")
         self.declare_parameter("scene_logits_output", "")
         self.declare_parameter("scene_labels_path", "")
+        self.declare_parameter("use_scene_category", True)
+        self.declare_parameter("scene_category_weight", 0.10)
+        self.declare_parameter("scene_category_top_k", 3)
 
-        self.declare_parameter("yolo_model_path", "/home/teleopbike/Documents/Mayowa/ros2_ws/src/slam/slam/weights/yolo26n-seg.engine")
+        self.declare_parameter("yolo_model_path", "/home/teleopbike/Documents/Mayowa/ros2_ws/src/slam/slam/weights/humanSLAM_YOLO_seg.engine")
         self.declare_parameter("yolo_confidence_threshold", 0.5)
         self.declare_parameter("yolo_box_geometry_fallback", True)
 
@@ -145,7 +154,13 @@ class HumanSLAMNode(Node):
         self.declare_parameter("ocr_max_objects_per_keyframe", 3)
         self.declare_parameter(
             "ocr_classes",
-            ["stop sign", "parking meter", "tv", "laptop", "book"],
+            [
+                "building",
+                "advertisement_sign",
+                "store_sign",
+                "information_sign",
+                "traffic_sign",
+            ],
         )
         # PaddlePaddle 3.3.1 currently fails on these OCRv5 models when the
         # oneDNN/MKLDNN executor is enabled.
@@ -153,7 +168,24 @@ class HumanSLAMNode(Node):
         self.declare_parameter("ocr_cpu_threads", 4)
         self.declare_parameter("ocr_text_det_limit_side_len", 640)
 
-        self.declare_parameter("stable_classes", ["traffic light","stop sign","parking meter","bench","chair","tv","laptop","book","clock"])
+        self.declare_parameter(
+            "stable_classes",
+            [
+                "building",
+                "bridge",
+                "advertisement_sign",
+                "store_sign",
+                "information_sign",
+                "traffic_sign",
+                "traffic_light",
+                "wall",
+                "fence",
+                "guard_rail",
+                "tunnel",
+                "street_light",
+                "pole",
+            ],
+        )
         self.declare_parameter("crop_margin", 10)
         self.declare_parameter("isolate_mask_for_ocr", True)
         self.declare_parameter("async_processing", True)
@@ -177,6 +209,10 @@ class HumanSLAMNode(Node):
 
         self.declare_parameter("semantic_threshold", 0.75)
         self.declare_parameter("geom_inlier_threshold", 30)
+        self.declare_parameter("latency_output", "")
+        self.declare_parameter("candidate_output", "")
+        self.declare_parameter("source_image_dir", "")
+        self.declare_parameter("debug_output_dir", "")
 
     def _read_parameters(self):
         self.camera_source = self.get_parameter("camera_source").value
@@ -202,6 +238,17 @@ class HumanSLAMNode(Node):
         ).value
         self.scene_logits_output = self.get_parameter("scene_logits_output").value
         self.scene_labels_path = self.get_parameter("scene_labels_path").value
+        self.use_scene_category = bool(
+            self.get_parameter("use_scene_category").value
+        )
+        self.scene_category_weight = max(
+            0.0, min(1.0, float(
+                self.get_parameter("scene_category_weight").value
+            ))
+        )
+        self.scene_category_top_k = max(
+            1, int(self.get_parameter("scene_category_top_k").value)
+        )
 
         self.yolo_model_path = self.get_parameter("yolo_model_path").value
         self.yolo_conf = float(self.get_parameter("yolo_confidence_threshold").value)
@@ -277,6 +324,10 @@ class HumanSLAMNode(Node):
 
         self.semantic_threshold = float(self.get_parameter("semantic_threshold").value)
         self.geom_inlier_threshold = int(self.get_parameter("geom_inlier_threshold").value)
+        self.latency_output = str(self.get_parameter("latency_output").value)
+        self.candidate_output = str(self.get_parameter("candidate_output").value)
+        self.source_image_dir = str(self.get_parameter("source_image_dir").value)
+        self.debug_output_dir = str(self.get_parameter("debug_output_dir").value)
 
     # ------------------------------------------------------------------
     # Model loading
@@ -316,7 +367,11 @@ class HumanSLAMNode(Node):
         if self.use_object or self.use_text:
             if not self.yolo_model_path:
                 raise RuntimeError("Parameter yolo_model_path is empty")
-            self.yolo = YOLO(self.yolo_model_path)
+            # TensorRT engine files do not carry enough filename metadata for
+            # Ultralytics to infer the task reliably. Declare segmentation at
+            # construction time or the engine silently returns boxes without
+            # masks and HumanSLAM falls back to coarser box geometry.
+            self.yolo = YOLO(self.yolo_model_path, task="segment")
             self.get_logger().info(f"YOLO model loaded: {self.yolo_model_path}")
             self.get_logger().debug(f"YOLO class names: {self.yolo.names}")
 
@@ -390,6 +445,8 @@ class HumanSLAMNode(Node):
         self._shutdown_event = threading.Event()
         self._semantic_queue = Queue(maxsize=self.semantic_queue_size)
         self._semantic_worker = None
+        self._latency_lock = threading.Lock()
+        self._latency_header_written = False
 
         if self.async_processing:
             self._semantic_worker = threading.Thread(
@@ -423,6 +480,7 @@ class HumanSLAMNode(Node):
                 "store_in_map": True,
                 "force_ocr": False,
                 "response_header": msg.header,
+                "received_monotonic": time.perf_counter(),
             }
         )
 
@@ -461,6 +519,7 @@ class HumanSLAMNode(Node):
                 "store_in_map": bool(msg.is_keyframe),
                 "force_ocr": int(msg.tracking_state) >= 3,
                 "response_header": msg.header,
+                "received_monotonic": time.perf_counter(),
             }
         )
 
@@ -512,22 +571,30 @@ class HumanSLAMNode(Node):
         store_in_map: bool,
         force_ocr: bool = False,
         response_header=None,
+        received_monotonic=None,
     ):
+        started = time.perf_counter()
+        received_monotonic = received_monotonic or started
+        debug_image = cv_image.copy() if self.debug_output_dir else None
         scene_record = (
             self.run_scene_classifier(cv_image)
             if self.use_scene
             else SceneRecord(embedding=None, confidence=0.0, label="disabled")
         )
+        scene_finished = time.perf_counter()
         self.scene_history.appendleft(scene_record)
 
         run_ocr = self.use_text and self.ocr_enabled and (
             force_ocr or keyframe_id % self.ocr_keyframe_interval == 0
         )
         static_objects = (
-            self.process_yolo_results(cv_image, run_ocr=run_ocr)
+            self.process_yolo_results(
+                cv_image, run_ocr=run_ocr, debug_image=debug_image
+            )
             if self.use_object or self.use_text
             else []
         )
+        perception_finished = time.perf_counter()
 
         current_keyframe = KeyframeRecord(
             keyframe_id=keyframe_id,
@@ -538,6 +605,7 @@ class HumanSLAMNode(Node):
             orb_keyframe_id=orb_keyframe_id,
             orb_map_id=orb_map_id,
             tracking_inliers=tracking_inliers,
+            source_frame_id=int(query_frame_id),
         )
 
         query_scene_seq = list(self.scene_history)
@@ -551,11 +619,36 @@ class HumanSLAMNode(Node):
             candidate_keyframes,
             candidate_scene_sequences,
         )
+        ranking_finished = time.perf_counter()
+        self._write_candidate_rows(
+            query_frame_id,
+            orb_keyframe_id,
+            current_keyframe,
+            query_scene_seq,
+            ranked_candidates,
+        )
         self._publish_semantic_candidates(
             query_frame_id,
             orb_keyframe_id,
             ranked_candidates,
             response_header,
+        )
+        published = time.perf_counter()
+        self._write_latency_row(
+            query_frame_id=query_frame_id,
+            is_keyframe=store_in_map,
+            queue_ms=(started - received_monotonic) * 1000.0,
+            scene_ms=(scene_finished - started) * 1000.0,
+            object_ocr_ms=(perception_finished - scene_finished) * 1000.0,
+            ranking_ms=(ranking_finished - perception_finished) * 1000.0,
+            total_ms=(published - received_monotonic) * 1000.0,
+            candidate_count=len(ranked_candidates),
+        )
+        self._write_debug_frame(
+            debug_image,
+            query_frame_id,
+            scene_record,
+            ranked_candidates,
         )
 
         if store_in_map:
@@ -567,6 +660,164 @@ class HumanSLAMNode(Node):
             f"{len(static_objects)} static objects, "
             f"{sum(len(obj.texts) for obj in static_objects)} OCR texts"
         )
+
+    def _write_latency_row(
+        self,
+        query_frame_id,
+        is_keyframe,
+        queue_ms,
+        scene_ms,
+        object_ocr_ms,
+        ranking_ms,
+        total_ms,
+        candidate_count,
+    ):
+        if not self.latency_output:
+            return
+        output = Path(self.latency_output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        row = [
+            time.time_ns(),
+            int(query_frame_id),
+            int(bool(is_keyframe)),
+            f"{queue_ms:.3f}",
+            f"{scene_ms:.3f}",
+            f"{object_ocr_ms:.3f}",
+            f"{ranking_ms:.3f}",
+            f"{total_ms:.3f}",
+            int(candidate_count),
+        ]
+        with self._latency_lock:
+            write_header = not output.exists() or output.stat().st_size == 0
+            with output.open("a", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                if write_header:
+                    writer.writerow(
+                        [
+                            "wall_time_ns",
+                            "query_frame_id",
+                            "is_keyframe",
+                            "queue_ms",
+                            "scene_ms",
+                            "object_ocr_ms",
+                            "ranking_ms",
+                            "total_ms",
+                            "candidate_count",
+                        ]
+                    )
+                writer.writerow(row)
+
+    def _frame_image_path(self, frame_id):
+        if not self.source_image_dir or frame_id is None:
+            return ""
+        base = Path(self.source_image_dir).expanduser()
+        for suffix in (".png", ".jpg", ".jpeg"):
+            candidate = base / f"{int(frame_id):06d}{suffix}"
+            if candidate.exists():
+                return str(candidate.resolve())
+        return str((base / f"{int(frame_id):06d}.png").resolve())
+
+    def _write_debug_frame(
+        self, debug_image, query_frame_id, scene_record, ranked_candidates
+    ):
+        if debug_image is None or not self.debug_output_dir:
+            return
+        lines = [
+            f"Frame {int(query_frame_id)}",
+            f"Scene: {scene_record.label} ({scene_record.confidence:.3f})",
+        ]
+        if scene_record.category_distribution:
+            categories = sorted(
+                scene_record.category_distribution.items(),
+                key=lambda item: item[1], reverse=True,
+            )[:3]
+            lines.append("Categories: " + ", ".join(
+                f"{name}={score:.2f}" for name, score in categories
+            ))
+        if ranked_candidates:
+            candidate, score, _ = ranked_candidates[0]
+            lines.append(
+                "Top candidate: "
+                f"KF={candidate.orb_keyframe_id} "
+                f"frame={candidate.source_frame_id} score={score:.3f}"
+            )
+        overlay_h = 28 * len(lines) + 12
+        cv2.rectangle(debug_image, (0, 0),
+                      (debug_image.shape[1], overlay_h), (0, 0, 0), -1)
+        for index, line in enumerate(lines):
+            cv2.putText(
+                debug_image, line, (10, 25 + index * 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2,
+                cv2.LINE_AA,
+            )
+        output = Path(self.debug_output_dir).expanduser()
+        output.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output / f"{int(query_frame_id):06d}.png"), debug_image)
+
+    @staticmethod
+    def _csv_score(value):
+        return "" if value is None else f"{float(value):.6f}"
+
+    def _write_candidate_rows(
+        self,
+        query_frame_id,
+        query_reference_keyframe_id,
+        query_keyframe,
+        query_scene_seq,
+        ranked_candidates,
+    ):
+        if not self.candidate_output or not ranked_candidates:
+            return
+
+        selected_count = min(self.candidate_response_count, len(ranked_candidates))
+        best_score = ranked_candidates[0][1]
+        second_score = ranked_candidates[1][1] if len(ranked_candidates) > 1 else None
+        ambiguous = (
+            second_score is not None
+            and best_score - second_score < self.semantic_ambiguity_margin
+        )
+        accepted = best_score >= self.semantic_threshold
+        output = Path(self.candidate_output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            "wall_time_ns", "query_frame_id", "query_image_path",
+            "query_reference_keyframe_id", "rank", "published",
+            "candidate_keyframe_id", "candidate_map_id",
+            "candidate_source_frame_id", "candidate_image_path",
+            "scene_score", "object_score", "text_score", "text_evidence",
+            "unified_score", "best_accepted", "best_ambiguous",
+            "geometric_verification_result", "caused_recovery",
+        ]
+        rows = []
+        for rank, (candidate, score, breakdown) in enumerate(
+            ranked_candidates, start=1
+        ):
+            candidate_kf_id = (
+                candidate.orb_keyframe_id
+                if candidate.orb_keyframe_id is not None
+                else candidate.keyframe_id
+            )
+            rows.append([
+                time.time_ns(), int(query_frame_id),
+                self._frame_image_path(query_frame_id),
+                int(query_reference_keyframe_id or 0), rank,
+                int(rank <= selected_count), int(candidate_kf_id),
+                int(candidate.orb_map_id or 0), candidate.source_frame_id,
+                self._frame_image_path(candidate.source_frame_id),
+                self._csv_score(breakdown["scene_score"]),
+                self._csv_score(breakdown["object_score"]),
+                self._csv_score(breakdown["text_score"]),
+                self._csv_score(breakdown["text_evidence"]),
+                self._csv_score(score), int(rank == 1 and accepted),
+                int(rank == 1 and ambiguous), "not_reported", "not_reported",
+            ])
+        with self._latency_lock:
+            write_header = not output.exists() or output.stat().st_size == 0
+            with output.open("a", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                if write_header:
+                    writer.writerow(header)
+                writer.writerows(rows)
 
     def _pose_message_to_matrix(self, pose_message):
         x = float(pose_message.orientation.x)
@@ -634,10 +885,14 @@ class HumanSLAMNode(Node):
                     if class_id < len(self.scene_labels)
                     else f"places365_{class_id}"
                 )
+                category_distribution = group_places365_probabilities(
+                    probabilities, self.scene_category_top_k
+                ) if self.use_scene_category else {}
             else:
                 probabilities = None
                 confidence = 1.0
                 label = "embedding"
+                category_distribution = {}
 
             descriptor = embedding if embedding is not None else probabilities
             if descriptor is None or descriptor.size == 0:
@@ -647,6 +902,7 @@ class HumanSLAMNode(Node):
                 embedding=descriptor.astype(np.float32, copy=False).reshape(-1),
                 confidence=confidence,
                 label=label,
+                category_distribution=category_distribution,
             )
         except Exception as exc:
             self.get_logger().error(f"Scene inference failed: {exc}")
@@ -824,7 +1080,9 @@ class HumanSLAMNode(Node):
     # YOLO segmentation + OCR processing
     # ------------------------------------------------------------------
 
-    def process_yolo_results(self, cv_image, run_ocr: bool = True):
+    def process_yolo_results(
+        self, cv_image, run_ocr: bool = True, debug_image=None
+    ):
         h, w, _ = cv_image.shape
         static_objects = []
         ocr_objects_processed = 0
@@ -879,6 +1137,7 @@ class HumanSLAMNode(Node):
 
                 x_centroid, y_centroid, area = geometry
                 texts = []
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
 
                 should_run_ocr = (
                     run_ocr
@@ -917,6 +1176,23 @@ class HumanSLAMNode(Node):
                         texts=texts,
                     )
                 )
+
+                if debug_image is not None:
+                    color = (60, 210, 255)
+                    if mask is not None:
+                        tint = np.zeros_like(debug_image)
+                        tint[mask > 0] = color
+                        cv2.addWeighted(tint, 0.35, debug_image, 1.0, 0,
+                                        dst=debug_image)
+                    cv2.rectangle(debug_image, (x1, y1), (x2, y2), color, 2)
+                    text_value = " | ".join(item.text for item in texts)
+                    label = f"{class_name} {confidence:.2f}"
+                    if text_value:
+                        label += f" OCR: {text_value}"
+                    cv2.putText(
+                        debug_image, label, (max(0, x1), max(18, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA,
+                    )
 
                 if self.verbose_detections:
                     self.get_logger().info(
@@ -1059,13 +1335,14 @@ class HumanSLAMNode(Node):
             candidate_keyframes,
             candidate_scene_sequences,
         ):
-            score = self.matcher.unified_score(
+            breakdown = self.matcher.score_breakdown(
                 query_keyframe=query_keyframe,
                 candidate_keyframe=candidate,
                 query_scene_seq=query_scene_seq,
                 candidate_scene_seq=scene_sequence,
             )
-            ranked.append((candidate, float(score)))
+            score = float(breakdown["unified_score"])
+            ranked.append((candidate, score, breakdown))
 
         ranked.sort(key=lambda item: item[1], reverse=True)
         return ranked
@@ -1091,15 +1368,15 @@ class HumanSLAMNode(Node):
             int(candidate.orb_keyframe_id)
             if candidate.orb_keyframe_id is not None
             else int(candidate.keyframe_id)
-            for candidate, _ in selected
+            for candidate, _, _ in selected
         ]
         message.candidate_map_ids = [
-            int(candidate.orb_map_id or 0) for candidate, _ in selected
+            int(candidate.orb_map_id or 0) for candidate, _, _ in selected
         ]
         message.candidate_poses = [
-            self._matrix_to_pose(candidate.pose) for candidate, _ in selected
+            self._matrix_to_pose(candidate.pose) for candidate, _, _ in selected
         ]
-        message.semantic_scores = [float(score) for _, score in selected]
+        message.semantic_scores = [float(score) for _, score, _ in selected]
         message.best_score = (
             float(message.semantic_scores[0])
             if message.semantic_scores
@@ -1114,7 +1391,6 @@ class HumanSLAMNode(Node):
         message.accepted = (
             bool(message.semantic_scores)
             and message.best_score >= self.semantic_threshold
-            and not message.ambiguous
         )
         self.semantic_candidates_publisher.publish(message)
 

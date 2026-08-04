@@ -8,6 +8,27 @@ build/
 install/
 log/
 results/
+test_results/
+test_scenarios/
+training_data/
+runs/
+dissertation/build/
+validation_results/
+
+# LaTeX generated output (keep .tex, bibliography and figure sources)
+dissertation/*.aux
+dissertation/*.bbl
+dissertation/*.bcf
+dissertation/*.lof
+dissertation/*.log
+dissertation/*.lot
+dissertation/*.out
+dissertation/*.pdf
+dissertation/*.run.xml
+dissertation/*.synctex.gz
+dissertation/*.toc
+dissertation/*.xdv
+dissertation/chapters/*.aux
 
 # Local IDE/tool state
 .agents/
@@ -25,4 +46,7 @@ tools/generate_methodology_docx.py
 
 # Hardware/runtime-specific model artefacts
 weights/*.engine
+weights/*.engine.json
 weights/*.onnx
+weights/*.pt
+yolo*.pt

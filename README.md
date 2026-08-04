@@ -155,7 +155,7 @@ Expected under `slam/weights/`:
 | File | Runtime purpose |
 |---|---|
 | `resnet50_places365_embed.engine` | Places365 TensorRT classification and 512-D scene embedding |
-| `yolo26n-seg.engine` | YOLO segmentation/object inference |
+| `humanSLAM_YOLO_seg.engine` | Mapillary-fine-tuned YOLO segmentation/object inference |
 | `resnet50_places365_embed.onnx` | Reproducible intermediate used to rebuild the scene engine |
 
 The ONNX model is not loaded during a normal run.
@@ -165,10 +165,9 @@ machine/runtime-specific and the scene engine exceeds GitHub's normal per-file
 limit. See `weights/README.md` for expected filenames, checksums and rebuild
 guidance.
 
-The current detector vocabulary is temporary. The planned custom stable-road
-dataset will add more useful persistent classes such as buildings, shopfronts,
-billboards and road signs. Do not list classes in `stable_classes` unless the
-deployed YOLO model actually supports them.
+The detector vocabulary contains 21 Mapillary-derived static-road classes.
+`stable_classes` remains an explicit trust/ablation allowlist and its values
+must match the deployed model's underscore-separated class names.
 
 ## Build
 
@@ -215,7 +214,7 @@ Edit `config/human_slam_params.yaml` and replace development-machine paths:
 
 ```yaml
 scene_classifier_path: "/path/to/resnet50_places365_embed.engine"
-yolo_model_path: "/path/to/yolo26n-seg.engine"
+yolo_model_path: "/path/to/humanSLAM_YOLO_seg.engine"
 ```
 
 Important parameter groups:
