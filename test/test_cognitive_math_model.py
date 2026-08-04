@@ -46,6 +46,27 @@ def test_identical_semantics_score_one():
     assert np.isclose(score, 1.0)
 
 
+def test_score_breakdown_exposes_each_semantic_layer():
+    model = CognitiveMathModel()
+    query_scene = scene([1.0, 0.0, 0.0])
+    candidate_scene = scene([1.0, 0.0, 0.0])
+    query = keyframe(1, query_scene, [landmark()])
+    candidate = keyframe(2, candidate_scene, [landmark()])
+
+    result = model.score_breakdown(
+        query, candidate, [query_scene], [candidate_scene]
+    )
+
+    assert set(result) == {
+        "scene_score", "object_score", "text_score", "text_evidence",
+        "unified_score",
+    }
+    assert np.isclose(result["scene_score"], 1.0)
+    assert np.isclose(result["object_score"], 1.0)
+    assert np.isclose(result["text_score"], 1.0)
+    assert np.isclose(result["unified_score"], 1.0)
+
+
 def test_different_semantics_score_zero():
     model = CognitiveMathModel()
     query_scene = scene([1.0, 0.0, 0.0])
