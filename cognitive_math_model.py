@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from slam.types import KeyframeRecord, SceneRecord, StaticObject
+from slam.scene_categories import category_compatibility
 
 
 class CognitiveMathModel:
@@ -39,6 +40,8 @@ class CognitiveMathModel:
         use_object: bool = True,
         use_text: bool = True,
         text_conflict_floor: float = 0.25,
+        use_scene_category: bool = True,
+        scene_category_weight: float = 0.10,
     ) -> None:
         self.w_scene = float(w_scene)
         self.w_object = float(w_object)
@@ -53,6 +56,10 @@ class CognitiveMathModel:
         self.use_text = bool(use_text)
         self.text_conflict_floor = self._clamp(
             text_conflict_floor, 0.0, 1.0
+        )
+        self.use_scene_category = bool(use_scene_category)
+        self.scene_category_weight = self._clamp(
+            scene_category_weight, 0.0, 1.0
         )
 
         if not any((self.use_scene, self.use_object, self.use_text)):
@@ -105,6 +112,19 @@ class CognitiveMathModel:
 
             feature_sim = float(np.dot(q_emb, c_emb))
             feature_sim = self._clamp(feature_sim, 0.0, 1.0)
+
+            if self.use_scene_category and self.scene_category_weight > 0.0:
+                compatibility = category_compatibility(
+                    q_scene.category_distribution,
+                    c_scene.category_distribution,
+                )
+                if q_scene.category_distribution and c_scene.category_distribution:
+                    # A bounded modulation: exact category agreement preserves
+                    # the embedding score; disagreement can only reduce it by
+                    # at most the configured fraction.
+                    feature_sim *= (
+                        1.0 + self.scene_category_weight * compatibility
+                    ) / (1.0 + self.scene_category_weight)
 
             # Classifier confidence describes certainty in the scene label; it
             # is not the reliability of the retrieval embedding. Multiplying
@@ -369,7 +389,29 @@ class CognitiveMathModel:
         Objects and text use only current query keyframe vs candidate keyframe.
         """
 
+        return self.score_breakdown(
+            query_keyframe,
+            candidate_keyframe,
+            query_scene_seq,
+            candidate_scene_seq,
+        )["unified_score"]
+
+    def score_breakdown(
+        self,
+        query_keyframe: KeyframeRecord,
+        candidate_keyframe: KeyframeRecord,
+        query_scene_seq: List[SceneRecord],
+        candidate_scene_seq: List[SceneRecord],
+    ) -> dict:
+        """Return the fused score and auditable per-layer contributions."""
         weighted_scores = []
+        result = {
+            "scene_score": None,
+            "object_score": None,
+            "text_score": None,
+            "text_evidence": 0.0,
+            "unified_score": 0.0,
+        }
 
         scene_available = (
             bool(query_scene_seq)
@@ -380,39 +422,40 @@ class CognitiveMathModel:
                     for item in candidate_scene_seq)
         )
         if self.use_scene and self.w_scene > 0.0 and scene_available:
-            weighted_scores.append(
-                (self.w_scene, self.scene_similarity(
-                    query_scene_seq, candidate_scene_seq
-                ))
+            result["scene_score"] = self.scene_similarity(
+                query_scene_seq, candidate_scene_seq
             )
+            weighted_scores.append((self.w_scene, result["scene_score"]))
 
         object_available = (
             bool(query_keyframe.static_objects)
             and bool(candidate_keyframe.static_objects)
         )
         if self.use_object and self.w_object > 0.0 and object_available:
-            weighted_scores.append(
-                (self.w_object, self.object_similarity(
-                    query_keyframe, candidate_keyframe
-                ))
+            result["object_score"] = self.object_similarity(
+                query_keyframe, candidate_keyframe
             )
+            weighted_scores.append((self.w_object, result["object_score"]))
 
         if self.use_text and self.w_text > 0.0:
             s_text, gamma_t = self.text_similarity(
                 query_keyframe, candidate_keyframe
             )
+            result["text_score"] = s_text
+            result["text_evidence"] = gamma_t
             if gamma_t > 0.0:
                 weighted_scores.append((self.w_text * gamma_t, s_text))
 
         denominator = sum(weight for weight, _ in weighted_scores)
         if denominator <= 0.0:
-            return 0.0
+            return result
 
         score = sum(
             weight * layer_score for weight, layer_score in weighted_scores
         ) / denominator
 
-        return self._clamp(float(score), 0.0, 1.0)
+        result["unified_score"] = self._clamp(float(score), 0.0, 1.0)
+        return result
 
     def select_best_candidate(
         self,

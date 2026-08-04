@@ -114,6 +114,24 @@ interpretability, but it does not multiply the retrieval embedding similarity:
 classification certainty and embedding suitability are different quantities,
 and multiplying confidences suppressed valid identical-place matches.
 
+For additional context, the top three Places365 probabilities are aggregated
+by their official class indices into road-localisation groups: urban road,
+residential, commercial, parking, major transport, industrial, rural road,
+natural and restricted/special. Unmapped classes form an uncertain `other`
+group. A compatibility value of 1.0 is used for the same informative group,
+0.6 for related groups, 0.3 when `other` is involved and 0 for incompatible
+groups. With category weight \(\lambda_c\), the per-frame embedding similarity
+is modulated as
+
+\[
+\tilde S_e = S_e\frac{1+\lambda_c C_{cat}}{1+\lambda_c}.
+\]
+
+The default \(\lambda_c=0.10\) makes category evidence deliberately weak:
+matching context preserves the embedding score, while a mismatch can reduce it
+by at most about 9.1 percent. It cannot create a match without vector
+similarity. `use_scene_category` independently disables this term for ablation.
+
 The scene layer also performs the inexpensive global preselection. Only its top
 \(K\) candidates are passed to the more detailed object/text fusion, controlling
 latency as the map grows.

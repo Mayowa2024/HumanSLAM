@@ -1,0 +1,22 @@
+\chapter{System Implementation}
+\label{chap:implementation}
+
+\section{ROS~2 integration}
+
+\section{HumanSLAM modules}
+
+\section{Modified ORB-SLAM3 interface}
+
+\section{Offline dataset pipeline}
+
+\section{Runtime and deployment optimisation}
+
+The stable-object segmenter was fine-tuned from COCO-pretrained YOLO26n-seg on
+a 21-class Mapillary Vistas taxonomy designed for persistent road landmarks.
+The taxonomy includes buildings, walls, fences, signs, poles and street
+furniture, and supplies instance masks to the spatial and OCR layers. The
+selected checkpoint was exported to a fixed-batch-one, 640-pixel FP16 TensorRT
+engine. HumanSLAM explicitly loads the engine as a segmentation task so that
+both boxes and masks are retained. The PyTorch checkpoint is preserved as the
+portable reference implementation, while the TensorRT engine is the deployed
+RTX 4070 implementation.

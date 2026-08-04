@@ -1,0 +1,83 @@
+% !TeX program = xelatex
+% !TeX root = main.tex
+\documentclass[12pt,a4paper,oneside]{report}
+
+\usepackage[british]{babel}
+\usepackage{fontspec}
+% Liberation Sans is the installed metrically compatible substitute for Arial.
+% Change this to Arial if the Microsoft font is installed before submission.
+\setmainfont{Liberation Sans}
+\usepackage[a4paper,left=30mm,right=20mm,top=20mm,bottom=20mm]{geometry}
+\usepackage{setspace}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{pdfpages}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{siunitx}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{csquotes}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+\usepackage[backend=biber,style=ieee,sorting=none]{biblatex}
+\usepackage{fancyhdr}
+
+\addbibresource{references.bib}
+\graphicspath{{figures/}}
+\onehalfspacing
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0pt}
+
+\title{HumanSLAM:A Human-Inspired Stereo-Inertial SLAM Frame-
+work For Context-Aware Autonomous Vehicle Localisation}
+\author{Mayowa Adebambo}
+\date{2026}
+
+\begin{document}
+\pagenumbering{roman}
+% Export the completed and electronically signed Moodle cover sheet as
+% frontmatter/cover_sheet.pdf. The temporary title page is used until then.
+\IfFileExists{frontmatter/cover_sheet.pdf}
+  {\includepdf[pages=-]{frontmatter/cover_sheet.pdf}}
+  {\maketitle}
+
+\begin{abstract}
+  Replace this text with the final dissertation abstract.
+\end{abstract}
+
+\chapter*{Acknowledgements}
+Replace this text with acknowledgements, or remove the page if none are needed.
+
+\chapter*{Glossary}
+\addcontentsline{toc}{chapter}{Glossary}
+\begin{description}
+  \item[ATE] Absolute Trajectory Error
+  \item[FAST] Features from Accelerated Segment Test
+  \item[HumanSLAM] Human-inspired semantic simultaneous localisation and mapping
+  \item[ORB] Oriented FAST and Rotated BRIEF
+  \item[RPE] Relative Pose Error
+  \item[SLAM] Simultaneous Localisation and Mapping
+\end{description}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\clearpage
+\pagenumbering{arabic}
+\input{chapters/01_introduction}
+\input{chapters/02_literature_review}
+\input{chapters/03_methodology}
+\input{chapters/04_implementation}
+\input{chapters/05_evaluation}
+\input{chapters/06_results_discussion}
+\input{chapters/07_conclusion}
+
+\printbibliography[heading=bibintoc]
+\appendix
+\input{chapters/appendix}
+\end{document}

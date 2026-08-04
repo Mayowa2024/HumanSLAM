@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 import numpy as np
 
 
@@ -18,6 +18,7 @@ class SceneRecord:
     embedding: Optional[np.ndarray]
     confidence: float = 0.0
     label: str = ""
+    category_distribution: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,3 +70,6 @@ class KeyframeRecord:
     orb_keyframe_id: Optional[int] = None
     orb_map_id: Optional[int] = None
     tracking_inliers: Optional[int] = None
+    # Original dataset/ORB frame that produced this semantic record.  This is
+    # distinct from ORB's keyframe ID and is required for visual evaluation.
+    source_frame_id: Optional[int] = None

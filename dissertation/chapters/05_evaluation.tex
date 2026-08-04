@@ -1,0 +1,43 @@
+\chapter{Evaluation}
+\label{chap:evaluation}
+
+\section{Datasets and experimental splits}
+
+The KITTI odometry runs on sequences 00--10 use the stereo camera streams only.
+They do not use inertial measurements and must therefore be reported as a
+stereo ORB-SLAM3 baseline, not as stereo-inertial results.
+
+\section{Baselines}
+
+The primary offline baseline is ORB-SLAM3 in stereo mode. Any later
+stereo-inertial experiment will be reported as a separate sensor configuration
+and will not be pooled with the KITTI stereo results.
+
+\section{Accuracy and recovery metrics}
+
+\section{Latency metrics}
+
+Detector latency was measured after one warm-up prediction using batch size
+one, an input size of 640 pixels and CUDA device 0. The same locked manifest of
+240 image paths was supplied to COCO PyTorch, Mapillary PyTorch and Mapillary
+TensorRT models. Median and 95th-percentile preprocessing, inference and
+postprocessing latency were recorded. Accuracy was evaluated separately on all
+2,000 labelled images in the converted Mapillary validation split using box and
+mask precision, recall, mAP50 and mAP50--95. The COCO model was excluded from
+the Mapillary accuracy comparison because its class schema is incompatible;
+raw detections on unlabeled KITTI, CARLA and Oxford images were treated only as
+qualitative domain-transfer evidence.
+
+\section{Ablation protocol}
+
+\section{Software testing}
+
+\section{Threats to validity}
+
+The detector latency results are specific to the tested RTX 4070, CUDA and
+TensorRT environment and exclude ROS queueing, OCR, retrieval and ORB-SLAM3
+processing. Mapillary validation measures in-domain segmentation accuracy;
+the external datasets were not labelled in the 21-class HumanSLAM schema.
+Consequently, external detection counts cannot establish precision, recall or
+SLAM improvement. The final localisation claim must instead be supported by
+matched ORB-SLAM3/HumanSLAM trajectory, recovery and retrieval experiments.

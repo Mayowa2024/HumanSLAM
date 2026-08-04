@@ -1,0 +1,48 @@
+\chapter{Results and Discussion}
+\label{chap:results}
+
+\section{Stable-object segmentation results}
+
+The detector accuracy and deployment trade-off are reported together in
+\cref{tab:detector-tradeoff}.
+
+\section{Semantic retrieval results}
+
+\section{Relocalisation and map-fusion results}
+
+\section{Trajectory accuracy}
+
+\section{Accuracy--latency trade-off}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Detector accuracy--latency trade-off. Mask accuracy uses the 2,000
+  labelled Mapillary validation images; pipeline latency uses the identical
+  240-image cross-domain manifest. Lower latency and higher accuracy are
+  preferable.}
+  \label{tab:detector-tradeoff}
+  \small
+  \begin{tabular}{@{}lrrrrrr@{}}
+    \toprule
+    Model & Mask P & Mask R & mAP50 & mAP50--95 & Median (ms) & P95 (ms) \\
+    \midrule
+    COCO PyTorch       & --     & --     & --     & --     & 13.01 & 15.37 \\
+    Mapillary PyTorch  & 0.3209 & 0.1566 & 0.1366 & 0.0572 & 13.30 & 15.14 \\
+    Mapillary TensorRT & 0.3207 & 0.1578 & 0.1393 & 0.0582 & \textbf{4.84} & \textbf{6.02} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+COCO accuracy is omitted because its labels do not match the HumanSLAM
+taxonomy. TensorRT preserved Mapillary mask accuracy while reducing median
+pipeline latency by 63.6\% (2.75-fold); full-validation inference also fell
+from 10.93 to 2.27 ms per image. It was therefore selected for its stable
+landmark classes, masks and substantially lower latency.
+
+\section{Ablation results}
+
+\section{Failure cases and limitations}
+
+\section{Critical reflection}
+
+\section{Original contribution}
