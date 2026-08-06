@@ -1,5 +1,5 @@
 # HumanSLAM
-
+# N.B add ros graph to report
 HumanSLAM is a semantic place-recognition extension for ORB-SLAM3. It describes
 ORB-SLAM3 keyframes using temporal scene context, stable-object layout and
 object-grounded OCR, then returns ranked map/keyframe candidates for
