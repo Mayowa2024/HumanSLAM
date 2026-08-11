@@ -2,6 +2,7 @@ import math
 from typing import List, Optional, Tuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from slam.types import KeyframeRecord, SceneRecord, StaticObject
 from slam.scene_categories import category_compatibility
@@ -35,7 +36,7 @@ class CognitiveMathModel:
         sigma_mask: float = 0.25,
         lambda_area: float = 1.0,
         text_geom_threshold: float = 0.6,
-        semantic_threshold: float = 0.75,
+        semantic_threshold: float = 0.70,
         use_scene: bool = True,
         use_object: bool = True,
         use_text: bool = True,
@@ -166,7 +167,11 @@ class CognitiveMathModel:
         """
         Computes M_obj between two objects.
 
-        M_obj = class_gate * query_conf * candidate_conf * S_geom
+        M_obj = class_gate * sqrt(query_conf * candidate_conf) * S_geom
+
+        Confidence expresses evidence reliability.  The geometric similarity
+        must not square confidence merely because the same detector observed
+        both frames.
         """
 
         if q_obj.class_name != c_obj.class_name:
@@ -176,7 +181,8 @@ class CognitiveMathModel:
         c_conf = self._clamp(c_obj.seg_conf, 0.0, 1.0)
         s_geom = self.spatial_similarity(q_obj, c_obj)
 
-        return self._clamp(q_conf * c_conf * s_geom, 0.0, 1.0)
+        reliability = math.sqrt(q_conf * c_conf)
+        return self._clamp(reliability * s_geom, 0.0, 1.0)
 
     def object_similarity(
         self,
@@ -186,7 +192,9 @@ class CognitiveMathModel:
         """
         Computes S_obj between the current query keyframe and one candidate keyframe.
 
-        For every query static object, find the best matching candidate object.
+        Find an optimal one-to-one assignment within each exact object class.
+        Unmatched query objects contribute zero; a candidate object cannot be
+        reused to explain multiple query objects.
         """
 
         q_objects = query_keyframe.static_objects
@@ -195,17 +203,26 @@ class CognitiveMathModel:
         if len(q_objects) == 0 or len(c_objects) == 0:
             return 0.0
 
-        best_scores = []
+        matched_score = 0.0
+        classes = {item.class_name for item in q_objects}
+        for class_name in classes:
+            query_class = [item for item in q_objects
+                           if item.class_name == class_name]
+            candidate_class = [item for item in c_objects
+                               if item.class_name == class_name]
+            if not candidate_class:
+                continue
+            scores = np.asarray([
+                [self.object_match_score(query, candidate)
+                 for candidate in candidate_class]
+                for query in query_class
+            ], dtype=np.float64)
+            query_indices, candidate_indices = linear_sum_assignment(
+                scores, maximize=True
+            )
+            matched_score += float(scores[query_indices, candidate_indices].sum())
 
-        for q_obj in q_objects:
-            best = 0.0
-
-            for c_obj in c_objects:
-                best = max(best, self.object_match_score(q_obj, c_obj))
-
-            best_scores.append(best)
-
-        return self._clamp(float(np.mean(best_scores)), 0.0, 1.0)
+        return self._clamp(matched_score / len(q_objects), 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Layer 3: Object-grounded text similarity
@@ -310,6 +327,17 @@ class CognitiveMathModel:
             self._clamp(evidence_strength, 0.0, 1.0),
         )
 
+    def text_evidence_strength(self, keyframe: KeyframeRecord) -> float:
+        """Return query/candidate OCR evidence quality independent of its peer."""
+        strengths = [
+            self.text_distinctiveness(text.text)
+            for obj in keyframe.static_objects
+            for text in obj.texts
+        ]
+        if not strengths:
+            return 0.0
+        return self._clamp(float(np.mean(strengths)), 0.0, 1.0)
+
     def string_similarity(self, a: str, b: str) -> float:
         """
         Normalised Levenshtein similarity.
@@ -403,7 +431,12 @@ class CognitiveMathModel:
         query_scene_seq: List[SceneRecord],
         candidate_scene_seq: List[SceneRecord],
     ) -> dict:
-        """Return the fused score and auditable per-layer contributions."""
+        """Return fused score using a denominator determined only by the query.
+
+        A layer supported by the query keeps the same weight for every
+        candidate. Missing candidate evidence therefore contributes zero
+        instead of removing that layer from the denominator.
+        """
         weighted_scores = []
         result = {
             "scene_score": None,
@@ -413,38 +446,53 @@ class CognitiveMathModel:
             "unified_score": 0.0,
         }
 
-        scene_available = (
+        query_scene_available = (
             bool(query_scene_seq)
-            and bool(candidate_scene_seq)
             and any(item is not None and item.embedding is not None
                     for item in query_scene_seq)
+        )
+        candidate_scene_available = (
+            bool(candidate_scene_seq)
             and any(item is not None and item.embedding is not None
                     for item in candidate_scene_seq)
         )
-        if self.use_scene and self.w_scene > 0.0 and scene_available:
-            result["scene_score"] = self.scene_similarity(
-                query_scene_seq, candidate_scene_seq
+        if self.use_scene and self.w_scene > 0.0 and query_scene_available:
+            result["scene_score"] = (
+                self.scene_similarity(query_scene_seq, candidate_scene_seq)
+                if candidate_scene_available else 0.0
             )
             weighted_scores.append((self.w_scene, result["scene_score"]))
 
-        object_available = (
-            bool(query_keyframe.static_objects)
-            and bool(candidate_keyframe.static_objects)
-        )
-        if self.use_object and self.w_object > 0.0 and object_available:
-            result["object_score"] = self.object_similarity(
-                query_keyframe, candidate_keyframe
+        query_object_available = bool(query_keyframe.static_objects)
+        candidate_object_available = bool(candidate_keyframe.static_objects)
+        if self.use_object and self.w_object > 0.0 and query_object_available:
+            result["object_score"] = (
+                self.object_similarity(query_keyframe, candidate_keyframe)
+                if candidate_object_available else 0.0
             )
             weighted_scores.append((self.w_object, result["object_score"]))
 
         if self.use_text and self.w_text > 0.0:
-            s_text, gamma_t = self.text_similarity(
-                query_keyframe, candidate_keyframe
-            )
-            result["text_score"] = s_text
-            result["text_evidence"] = gamma_t
-            if gamma_t > 0.0:
-                weighted_scores.append((self.w_text * gamma_t, s_text))
+            query_text_strength = self.text_evidence_strength(query_keyframe)
+            if query_text_strength > 0.0:
+                candidate_text_strength = self.text_evidence_strength(
+                    candidate_keyframe
+                )
+                s_text, _ = self.text_similarity(
+                    query_keyframe, candidate_keyframe
+                )
+                # Candidate evidence cannot increase the query-selected layer
+                # above one, but missing/weaker candidate OCR is penalised.
+                shared_strength = min(
+                    query_text_strength, candidate_text_strength
+                )
+                reliability_ratio = shared_strength / query_text_strength
+                result["text_score"] = s_text
+                result["text_evidence"] = shared_strength
+                weighted_scores.append((
+                    self.w_text * query_text_strength,
+                    s_text * reliability_ratio,
+                ))
 
         denominator = sum(weight for weight, _ in weighted_scores)
         if denominator <= 0.0:
@@ -496,7 +544,7 @@ class CognitiveMathModel:
             ORB-SLAM3 inliers are low and semantic confidence is high.
         """
 
-        return n_inliers < geom_threshold and semantic_score >= self.semantic_threshold
+        return n_inliers < geom_threshold and semantic_score > self.semantic_threshold
 
     # ------------------------------------------------------------------
     # Helpers

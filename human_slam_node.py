@@ -18,8 +18,113 @@ from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
 from slam.cognitive_math_model import CognitiveMathModel
+from slam.global_place_descriptor import (
+    DescriptorSpec,
+    TensorRTGlobalDescriptor,
+)
 from slam.scene_categories import group_places365_probabilities
 from slam.types import KeyframeRecord, SceneRecord, StaticObject, TextAnchor
+
+
+def should_run_candidate_retrieval(
+    is_keyframe: bool,
+    keyframe_id: int,
+    tracking_state: int,
+    periodic_loop_keyframe_interval: int,
+) -> bool:
+    """Schedule periodic loop search while preserving immediate recovery."""
+    if tracking_state >= 3:
+        return True
+    if not is_keyframe:
+        return False
+    interval = max(1, int(periodic_loop_keyframe_interval))
+    return keyframe_id % interval == 0
+
+
+def candidates_above_threshold(ranked_candidates, threshold, limit):
+    """Return only candidates strictly above the ORB submission threshold."""
+    return [
+        item for item in ranked_candidates
+        if float(item[1]) > float(threshold)
+    ][:max(0, int(limit))]
+
+
+def apply_weak_scene_consensus_policy(
+    ranked_candidates,
+    semantic_threshold,
+    effective_score,
+    enabled=True,
+    raw_threshold=0.55,
+    top_k=5,
+    minimum_support=3,
+    cluster_width_frames=30,
+):
+    """Promote one weak scene-only historical cluster to ORB geometry.
+
+    Normal above-threshold results always take precedence. Temporal exclusion
+    is performed before ranking by ``build_candidate_inputs``. This function
+    only supplies a conservative fallback when several top retrievals vote for
+    the same older frame neighbourhood.
+    """
+    if not enabled or not ranked_candidates:
+        return ranked_candidates
+    if candidates_above_threshold(ranked_candidates, semantic_threshold, 1):
+        return ranked_candidates
+
+    candidate, score, breakdown = ranked_candidates[0]
+    raw_score = float(breakdown.get("raw_unified_score", score))
+    if (
+        breakdown.get("evidence_label") != "weak_scene_only"
+        or raw_score < float(raw_threshold)
+        or candidate.source_frame_id is None
+    ):
+        return ranked_candidates
+
+    centre = int(candidate.source_frame_id)
+    support = 0
+    for item, _, item_breakdown in ranked_candidates[:max(1, int(top_k))]:
+        if (
+            item_breakdown.get("evidence_label") == "weak_scene_only"
+            and item.source_frame_id is not None
+            and abs(int(item.source_frame_id) - centre)
+            <= max(0, int(cluster_width_frames))
+        ):
+            support += 1
+    if support < max(1, int(minimum_support)):
+        return ranked_candidates
+
+    promoted_breakdown = dict(breakdown)
+    promoted_breakdown["effective_score"] = float(effective_score)
+    promoted_breakdown["evidence_label"] = "weak_scene_consensus"
+    promoted_breakdown["scene_consensus_support"] = support
+    return [
+        (candidate, float(effective_score), promoted_breakdown),
+        *ranked_candidates[1:],
+    ]
+
+
+def apply_scene_only_score_policy(
+    breakdown,
+    raw_score,
+    semantic_threshold,
+    scene_only_effective_score,
+):
+    """Demote a qualifying scene-only match without blocking geometry.
+
+    The raw model score remains available in ``breakdown`` for diagnostics and
+    tie-breaking. Only candidates that already clear the semantic threshold
+    are assigned the common low-confidence effective score.
+    """
+    scene_only = (
+        breakdown.get("scene_score") is not None
+        and breakdown.get("object_score") is None
+        and breakdown.get("text_score") is None
+    )
+    if scene_only:
+        if float(raw_score) > float(semantic_threshold):
+            return float(scene_only_effective_score), "weak_scene_only"
+        return float(raw_score), "weak_scene_only"
+    return float(raw_score), "strong_multi_layer"
 
 
 class HumanSLAMNode(Node):
@@ -135,6 +240,16 @@ class HumanSLAMNode(Node):
         self.declare_parameter("scene_embedding_output", "")
         self.declare_parameter("scene_logits_output", "")
         self.declare_parameter("scene_labels_path", "")
+        # Optional VPR descriptor.  When enabled it replaces the Places365
+        # embedding for retrieval/scoring while Places365 still supplies the
+        # scene label and grouped category evidence.
+        self.declare_parameter("global_descriptor_enabled", False)
+        self.declare_parameter("global_descriptor_name", "places365")
+        self.declare_parameter("global_descriptor_engine_path", "")
+        self.declare_parameter("global_descriptor_input_height", 320)
+        self.declare_parameter("global_descriptor_input_width", 320)
+        self.declare_parameter("global_descriptor_input_name", "")
+        self.declare_parameter("global_descriptor_output_name", "descriptor")
         self.declare_parameter("use_scene_category", True)
         self.declare_parameter("scene_category_weight", 0.10)
         self.declare_parameter("scene_category_top_k", 3)
@@ -193,7 +308,13 @@ class HumanSLAMNode(Node):
         self.declare_parameter("candidate_top_k", 25)
         self.declare_parameter("candidate_min_keyframe_separation", 20)
         self.declare_parameter("candidate_response_count", 5)
+        self.declare_parameter("periodic_loop_keyframe_interval", 5)
         self.declare_parameter("semantic_ambiguity_margin", 0.05)
+        self.declare_parameter("weak_scene_consensus_enabled", True)
+        self.declare_parameter("weak_scene_consensus_threshold", 0.55)
+        self.declare_parameter("weak_scene_consensus_top_k", 5)
+        self.declare_parameter("weak_scene_consensus_min_support", 3)
+        self.declare_parameter("weak_scene_consensus_cluster_width_frames", 30)
         self.declare_parameter("verbose_detections", False)
 
         self.declare_parameter("w_scene", 0.3)
@@ -207,7 +328,8 @@ class HumanSLAMNode(Node):
         self.declare_parameter("text_geom_threshold", 0.6)
         self.declare_parameter("text_conflict_floor", 0.25)
 
-        self.declare_parameter("semantic_threshold", 0.75)
+        self.declare_parameter("semantic_threshold", 0.70)
+        self.declare_parameter("scene_only_effective_score", 0.701)
         self.declare_parameter("geom_inlier_threshold", 30)
         self.declare_parameter("latency_output", "")
         self.declare_parameter("candidate_output", "")
@@ -238,6 +360,27 @@ class HumanSLAMNode(Node):
         ).value
         self.scene_logits_output = self.get_parameter("scene_logits_output").value
         self.scene_labels_path = self.get_parameter("scene_labels_path").value
+        self.global_descriptor_enabled = bool(
+            self.get_parameter("global_descriptor_enabled").value
+        )
+        self.global_descriptor_name = str(
+            self.get_parameter("global_descriptor_name").value
+        )
+        self.global_descriptor_engine_path = str(
+            self.get_parameter("global_descriptor_engine_path").value
+        )
+        self.global_descriptor_input_height = int(
+            self.get_parameter("global_descriptor_input_height").value
+        )
+        self.global_descriptor_input_width = int(
+            self.get_parameter("global_descriptor_input_width").value
+        )
+        self.global_descriptor_input_name = str(
+            self.get_parameter("global_descriptor_input_name").value
+        )
+        self.global_descriptor_output_name = str(
+            self.get_parameter("global_descriptor_output_name").value
+        )
         self.use_scene_category = bool(
             self.get_parameter("use_scene_category").value
         )
@@ -300,8 +443,30 @@ class HumanSLAMNode(Node):
         self.candidate_response_count = max(
             1, int(self.get_parameter("candidate_response_count").value)
         )
+        self.periodic_loop_keyframe_interval = max(
+            1,
+            int(self.get_parameter("periodic_loop_keyframe_interval").value),
+        )
         self.semantic_ambiguity_margin = max(
             0.0, float(self.get_parameter("semantic_ambiguity_margin").value)
+        )
+        self.weak_scene_consensus_enabled = bool(
+            self.get_parameter("weak_scene_consensus_enabled").value
+        )
+        self.weak_scene_consensus_threshold = float(
+            self.get_parameter("weak_scene_consensus_threshold").value
+        )
+        self.weak_scene_consensus_top_k = max(
+            1, int(self.get_parameter("weak_scene_consensus_top_k").value)
+        )
+        self.weak_scene_consensus_min_support = max(
+            1, int(self.get_parameter("weak_scene_consensus_min_support").value)
+        )
+        self.weak_scene_consensus_cluster_width_frames = max(
+            0,
+            int(self.get_parameter(
+                "weak_scene_consensus_cluster_width_frames"
+            ).value),
         )
         self.verbose_detections = bool(
             self.get_parameter("verbose_detections").value
@@ -323,17 +488,32 @@ class HumanSLAMNode(Node):
         )
 
         self.semantic_threshold = float(self.get_parameter("semantic_threshold").value)
+        self.scene_only_effective_score = float(
+            self.get_parameter("scene_only_effective_score").value
+        )
+        if self.scene_only_effective_score <= self.semantic_threshold:
+            self.get_logger().warn(
+                "scene_only_effective_score must be above semantic_threshold "
+                "for qualifying scene-only candidates to reach geometry "
+                f"({self.scene_only_effective_score:.3f} <= "
+                f"{self.semantic_threshold:.3f})"
+            )
         self.geom_inlier_threshold = int(self.get_parameter("geom_inlier_threshold").value)
         self.latency_output = str(self.get_parameter("latency_output").value)
         self.candidate_output = str(self.get_parameter("candidate_output").value)
         self.source_image_dir = str(self.get_parameter("source_image_dir").value)
         self.debug_output_dir = str(self.get_parameter("debug_output_dir").value)
+        self.get_logger().info(
+            "Periodic semantic loop detection: every "
+            f"{self.periodic_loop_keyframe_interval} keyframe(s)"
+        )
 
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
 
     def _load_models(self):
+        self.global_descriptor = None
         self.scene_runtime = None
         self.scene_engine = None
         self.scene_context = None
@@ -362,6 +542,24 @@ class HumanSLAMNode(Node):
                 # Keep node alive so YOLO/OCR can still be tested.
                 self.scene_engine = None
                 self.scene_context = None
+
+        if self.use_scene and self.global_descriptor_enabled:
+            if not self.global_descriptor_engine_path:
+                raise RuntimeError(
+                    "global_descriptor_enabled is true but engine path is empty"
+                )
+            spec = DescriptorSpec(
+                name=self.global_descriptor_name,
+                engine_path=Path(self.global_descriptor_engine_path),
+                input_height=self.global_descriptor_input_height,
+                input_width=self.global_descriptor_input_width,
+                input_name=self.global_descriptor_input_name,
+                output_name=self.global_descriptor_output_name,
+            )
+            self.global_descriptor = TensorRTGlobalDescriptor(spec)
+            self.get_logger().info(
+                f"Global descriptor loaded: {spec.name} ({spec.engine_path})"
+            )
 
         self.yolo = None
         if self.use_object or self.use_text:
@@ -501,6 +699,11 @@ class HumanSLAMNode(Node):
             else int(msg.frame_id)
         )
         pose = self._pose_message_to_matrix(msg.camera_pose) if msg.pose_valid else None
+        run_candidate_retrieval = self._should_run_candidate_retrieval(
+            is_keyframe=bool(msg.is_keyframe),
+            keyframe_id=keyframe_id,
+            tracking_state=int(msg.tracking_state),
+        )
 
         self._submit_semantic_task(
             {
@@ -518,6 +721,7 @@ class HumanSLAMNode(Node):
                 "tracking_inliers": int(msg.tracking_inliers),
                 "store_in_map": bool(msg.is_keyframe),
                 "force_ocr": int(msg.tracking_state) >= 3,
+                "run_candidate_retrieval": run_candidate_retrieval,
                 "response_header": msg.header,
                 "received_monotonic": time.perf_counter(),
             }
@@ -570,6 +774,7 @@ class HumanSLAMNode(Node):
         tracking_inliers,
         store_in_map: bool,
         force_ocr: bool = False,
+        run_candidate_retrieval: bool = True,
         response_header=None,
         received_monotonic=None,
     ):
@@ -609,16 +814,27 @@ class HumanSLAMNode(Node):
         )
 
         query_scene_seq = list(self.scene_history)
-        candidate_keyframes, candidate_scene_sequences = self.build_candidate_inputs(
-            query_scene_seq
-        )
-
-        ranked_candidates = self._rank_candidates(
-            current_keyframe,
-            query_scene_seq,
-            candidate_keyframes,
-            candidate_scene_sequences,
-        )
+        ranked_candidates = []
+        if run_candidate_retrieval:
+            candidate_keyframes, candidate_scene_sequences = (
+                self.build_candidate_inputs(query_scene_seq, current_keyframe)
+            )
+            ranked_candidates = self._rank_candidates(
+                current_keyframe,
+                query_scene_seq,
+                candidate_keyframes,
+                candidate_scene_sequences,
+            )
+            ranked_candidates = apply_weak_scene_consensus_policy(
+                ranked_candidates,
+                self.semantic_threshold,
+                self.scene_only_effective_score,
+                self.weak_scene_consensus_enabled,
+                self.weak_scene_consensus_threshold,
+                self.weak_scene_consensus_top_k,
+                self.weak_scene_consensus_min_support,
+                self.weak_scene_consensus_cluster_width_frames,
+            )
         ranking_finished = time.perf_counter()
         self._write_candidate_rows(
             query_frame_id,
@@ -648,6 +864,7 @@ class HumanSLAMNode(Node):
             debug_image,
             query_frame_id,
             scene_record,
+            static_objects,
             ranked_candidates,
         )
 
@@ -659,6 +876,17 @@ class HumanSLAMNode(Node):
             f"{keyframe_id}: "
             f"{len(static_objects)} static objects, "
             f"{sum(len(obj.texts) for obj in static_objects)} OCR texts"
+        )
+
+    def _should_run_candidate_retrieval(
+        self, is_keyframe: bool, keyframe_id: int, tracking_state: int
+    ) -> bool:
+        """Run recovery immediately, but same-map search periodically while OK."""
+        return should_run_candidate_retrieval(
+            is_keyframe,
+            keyframe_id,
+            tracking_state,
+            self.periodic_loop_keyframe_interval,
         )
 
     def _write_latency_row(
@@ -718,7 +946,8 @@ class HumanSLAMNode(Node):
         return str((base / f"{int(frame_id):06d}.png").resolve())
 
     def _write_debug_frame(
-        self, debug_image, query_frame_id, scene_record, ranked_candidates
+        self, debug_image, query_frame_id, scene_record, static_objects,
+        ranked_candidates
     ):
         if debug_image is None or not self.debug_output_dir:
             return
@@ -741,18 +970,41 @@ class HumanSLAMNode(Node):
                 f"KF={candidate.orb_keyframe_id} "
                 f"frame={candidate.source_frame_id} score={score:.3f}"
             )
-        overlay_h = 28 * len(lines) + 12
-        cv2.rectangle(debug_image, (0, 0),
-                      (debug_image.shape[1], overlay_h), (0, 0, 0), -1)
+        if static_objects:
+            object_labels = [
+                f"{item.class_name}={item.seg_conf:.2f}"
+                for item in static_objects[:5]
+            ]
+            lines.append("Objects: " + ", ".join(object_labels))
+            ocr_values = [
+                text.text
+                for item in static_objects
+                for text in item.texts
+                if text.text
+            ]
+            lines.append(
+                "OCR: " + (" | ".join(ocr_values[:4]) if ocr_values else "none")
+            )
+        else:
+            lines.extend(["Objects: none", "OCR: none"])
+        # Fixed-height diagnostics outside the camera image prevent the video
+        # geometry from changing as detections appear and disappear.
+        overlay_h = 190
+        annotated = np.zeros(
+            (debug_image.shape[0] + overlay_h, debug_image.shape[1], 3),
+            dtype=np.uint8,
+        )
+        annotated[:debug_image.shape[0], :] = debug_image
+        text_y = debug_image.shape[0]
         for index, line in enumerate(lines):
             cv2.putText(
-                debug_image, line, (10, 25 + index * 28),
+                annotated, line, (10, text_y + 25 + index * 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2,
                 cv2.LINE_AA,
             )
         output = Path(self.debug_output_dir).expanduser()
         output.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(output / f"{int(query_frame_id):06d}.png"), debug_image)
+        cv2.imwrite(str(output / f"{int(query_frame_id):06d}.png"), annotated)
 
     @staticmethod
     def _csv_score(value):
@@ -769,14 +1021,18 @@ class HumanSLAMNode(Node):
         if not self.candidate_output or not ranked_candidates:
             return
 
-        selected_count = min(self.candidate_response_count, len(ranked_candidates))
+        selected_count = len(candidates_above_threshold(
+            ranked_candidates,
+            self.semantic_threshold,
+            self.candidate_response_count,
+        ))
         best_score = ranked_candidates[0][1]
         second_score = ranked_candidates[1][1] if len(ranked_candidates) > 1 else None
         ambiguous = (
             second_score is not None
             and best_score - second_score < self.semantic_ambiguity_margin
         )
-        accepted = best_score >= self.semantic_threshold
+        accepted = best_score > self.semantic_threshold
         output = Path(self.candidate_output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
         header = [
@@ -785,7 +1041,8 @@ class HumanSLAMNode(Node):
             "candidate_keyframe_id", "candidate_map_id",
             "candidate_source_frame_id", "candidate_image_path",
             "scene_score", "object_score", "text_score", "text_evidence",
-            "unified_score", "best_accepted", "best_ambiguous",
+            "raw_unified_score", "effective_score", "evidence_label",
+            "best_accepted", "best_ambiguous",
             "geometric_verification_result", "caused_recovery",
         ]
         rows = []
@@ -801,14 +1058,18 @@ class HumanSLAMNode(Node):
                 time.time_ns(), int(query_frame_id),
                 self._frame_image_path(query_frame_id),
                 int(query_reference_keyframe_id or 0), rank,
-                int(rank <= selected_count), int(candidate_kf_id),
+                int(rank <= selected_count and score > self.semantic_threshold),
+                int(candidate_kf_id),
                 int(candidate.orb_map_id or 0), candidate.source_frame_id,
                 self._frame_image_path(candidate.source_frame_id),
                 self._csv_score(breakdown["scene_score"]),
                 self._csv_score(breakdown["object_score"]),
                 self._csv_score(breakdown["text_score"]),
                 self._csv_score(breakdown["text_evidence"]),
-                self._csv_score(score), int(rank == 1 and accepted),
+                self._csv_score(breakdown.get("raw_unified_score", score)),
+                self._csv_score(score),
+                str(breakdown.get("evidence_label", "strong_multi_layer")),
+                int(rank == 1 and accepted),
                 int(rank == 1 and ambiguous), "not_reported", "not_reported",
             ])
         with self._latency_lock:
@@ -865,7 +1126,10 @@ class HumanSLAMNode(Node):
         classifier-only engine therefore works, although a penultimate-layer
         embedding is usually more discriminative for loop-candidate retrieval.
         """
-        if self.scene_engine is None or self.scene_context is None:
+        if (
+            (self.scene_engine is None or self.scene_context is None)
+            and self.global_descriptor is None
+        ):
             return SceneRecord(
                 embedding=None,
                 confidence=0.0,
@@ -873,8 +1137,11 @@ class HumanSLAMNode(Node):
             )
 
         try:
-            outputs = self._execute_scene_engine(cv_image)
-            embedding, logits = self._select_scene_outputs(outputs)
+            if self.scene_engine is not None and self.scene_context is not None:
+                outputs = self._execute_scene_engine(cv_image)
+                embedding, logits = self._select_scene_outputs(outputs)
+            else:
+                embedding, logits = None, None
 
             if logits is not None:
                 probabilities = self._softmax(logits)
@@ -888,13 +1155,20 @@ class HumanSLAMNode(Node):
                 category_distribution = group_places365_probabilities(
                     probabilities, self.scene_category_top_k
                 ) if self.use_scene_category else {}
-            else:
+            elif embedding is not None:
                 probabilities = None
                 confidence = 1.0
                 label = "embedding"
                 category_distribution = {}
+            else:
+                probabilities = None
+                confidence = 1.0
+                label = self.global_descriptor_name
+                category_distribution = {}
 
             descriptor = embedding if embedding is not None else probabilities
+            if self.global_descriptor is not None:
+                descriptor = self.global_descriptor.describe(cv_image)
             if descriptor is None or descriptor.size == 0:
                 raise RuntimeError("Scene engine produced no usable output")
 
@@ -1185,14 +1459,8 @@ class HumanSLAMNode(Node):
                         cv2.addWeighted(tint, 0.35, debug_image, 1.0, 0,
                                         dst=debug_image)
                     cv2.rectangle(debug_image, (x1, y1), (x2, y2), color, 2)
-                    text_value = " | ".join(item.text for item in texts)
-                    label = f"{class_name} {confidence:.2f}"
-                    if text_value:
-                        label += f" OCR: {text_value}"
-                    cv2.putText(
-                        debug_image, label, (max(0, x1), max(18, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA,
-                    )
+                    # Labels and OCR are written in the fixed black footer by
+                    # _write_debug_frame, not over moving image content.
 
                 if self.verbose_detections:
                     self.get_logger().info(
@@ -1341,10 +1609,24 @@ class HumanSLAMNode(Node):
                 query_scene_seq=query_scene_seq,
                 candidate_scene_seq=scene_sequence,
             )
-            score = float(breakdown["unified_score"])
+            raw_score = float(breakdown["unified_score"])
+            score, evidence_label = apply_scene_only_score_policy(
+                breakdown,
+                raw_score,
+                self.semantic_threshold,
+                self.scene_only_effective_score,
+            )
+            breakdown["raw_unified_score"] = raw_score
+            breakdown["effective_score"] = score
+            breakdown["evidence_label"] = evidence_label
             ranked.append((candidate, score, breakdown))
 
-        ranked.sort(key=lambda item: item[1], reverse=True)
+        ranked.sort(
+            key=lambda item: (
+                item[1], item[2].get("raw_unified_score", item[1])
+            ),
+            reverse=True,
+        )
         return ranked
 
     def _publish_semantic_candidates(
@@ -1363,7 +1645,11 @@ class HumanSLAMNode(Node):
             query_reference_keyframe_id or 0
         )
 
-        selected = ranked_candidates[: self.candidate_response_count]
+        selected = candidates_above_threshold(
+            ranked_candidates,
+            self.semantic_threshold,
+            self.candidate_response_count,
+        )
         message.candidate_keyframe_ids = [
             int(candidate.orb_keyframe_id)
             if candidate.orb_keyframe_id is not None
@@ -1388,10 +1674,7 @@ class HumanSLAMNode(Node):
             and message.semantic_scores[0] - message.semantic_scores[1]
             < self.semantic_ambiguity_margin
         )
-        message.accepted = (
-            bool(message.semantic_scores)
-            and message.best_score >= self.semantic_threshold
-        )
+        message.accepted = bool(message.semantic_scores)
         self.semantic_candidates_publisher.publish(message)
 
         if message.candidate_keyframe_ids:
@@ -1450,7 +1733,7 @@ class HumanSLAMNode(Node):
                 message.orientation.z = 0.25 * scale
         return message
 
-    def build_candidate_inputs(self, query_scene_seq=None):
+    def build_candidate_inputs(self, query_scene_seq=None, query_keyframe=None):
         """
         Returns:
             candidate_keyframes:
@@ -1465,6 +1748,31 @@ class HumanSLAMNode(Node):
         )
 
         for i, keyframe in enumerate(self.map_memory[:newest_eligible_index]):
+            if query_keyframe is not None:
+                query_orb_id = (
+                    query_keyframe.orb_keyframe_id
+                    if query_keyframe.orb_keyframe_id is not None
+                    else query_keyframe.keyframe_id
+                )
+                candidate_orb_id = (
+                    keyframe.orb_keyframe_id
+                    if keyframe.orb_keyframe_id is not None
+                    else keyframe.keyframe_id
+                )
+                # Async semantic storage means list-index distance alone is not
+                # a reliable measure of age. Enforce both ORB-keyframe and
+                # source-frame separation explicitly.
+                if abs(int(query_orb_id) - int(candidate_orb_id)) < self.candidate_min_separation:
+                    continue
+                if (
+                    query_keyframe.source_frame_id is not None
+                    and keyframe.source_frame_id is not None
+                    and abs(
+                        int(query_keyframe.source_frame_id)
+                        - int(keyframe.source_frame_id)
+                    ) < self.candidate_min_separation
+                ):
+                    continue
             scene_seq = []
 
             for j in range(i, max(-1, i - 3), -1):

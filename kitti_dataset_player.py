@@ -9,6 +9,7 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import Imu
 
 
 def _natural_key(path):
@@ -35,7 +36,12 @@ class KittiDatasetPlayer(Node):
         self.declare_parameter("end_frame", -1)
         self.declare_parameter("startup_delay", 3.0)
         self.declare_parameter("completion_delay", 2.0)
+        self.declare_parameter("stereo_publish_gap", 0.01)
         self.declare_parameter("results_dir", "")
+        self.declare_parameter("imu_file", "")
+        self.declare_parameter("imu_topic", "/dataset/imu")
+        self.declare_parameter("imu_frame_id", "imu")
+        self.declare_parameter("imu_decimation", 1)
 
         root_value = str(self.get_parameter("dataset_path").value)
         if not root_value:
@@ -55,6 +61,9 @@ class KittiDatasetPlayer(Node):
         self.completion_delay = max(
             0.0, float(self.get_parameter("completion_delay").value)
         )
+        self.stereo_publish_gap = max(
+            0.0, float(self.get_parameter("stereo_publish_gap").value)
+        )
         results_dir = str(self.get_parameter("results_dir").value)
         if results_dir:
             Path(results_dir).expanduser().mkdir(parents=True, exist_ok=True)
@@ -62,6 +71,15 @@ class KittiDatasetPlayer(Node):
         self.left_images = self._find_images(self.left_dir)
         self.right_images = self._find_images(self.right_dir)
         self.timestamps = self._read_timestamps(self.times_path)
+        imu_file = str(self.get_parameter("imu_file").value)
+        self.imu_samples = (
+            self._read_imu(self.root / imu_file) if imu_file else []
+        )
+        self.imu_frame_id = str(self.get_parameter("imu_frame_id").value)
+        self.imu_decimation = max(
+            1, int(self.get_parameter("imu_decimation").value)
+        )
+        self.imu_index = 0
         self._validate_sequence()
 
         final_index = len(self.timestamps)
@@ -78,6 +96,11 @@ class KittiDatasetPlayer(Node):
         self.right_pub = self.create_publisher(
             Image, str(self.get_parameter("right_topic").value), qos
         )
+        self.imu_pub = self.create_publisher(
+            Imu,
+            str(self.get_parameter("imu_topic").value),
+            QoSProfile(depth=2000, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
         self.bridge = CvBridge()
         self.current = 0
         self.wall_start = None
@@ -88,6 +111,11 @@ class KittiDatasetPlayer(Node):
             f"Offline dataset ready: {self.root} "
             f"({len(self.indices)} stereo pairs)"
         )
+        if self.imu_samples:
+            self.get_logger().info(
+                f"IMU ready: {len(self.imu_samples)} samples "
+                f"(decimation={self.imu_decimation})"
+            )
         self.get_logger().info(
             "Waiting for ORB-SLAM3/HumanSLAM subscribers before playback"
         )
@@ -118,7 +146,12 @@ class KittiDatasetPlayer(Node):
             if not value:
                 continue
             try:
-                timestamps.append(float(value))
+                fields = value.split()
+                # KITTI stores one relative-seconds value. 4Seasons stores
+                # timestamp_ns, timestamp_seconds, exposure_seconds.
+                timestamps.append(
+                    float(fields[1]) if len(fields) >= 2 else float(fields[0])
+                )
             except ValueError as exc:
                 raise ValueError(
                     f"Invalid timestamp at {path}:{line_number}: {value}"
@@ -143,6 +176,56 @@ class KittiDatasetPlayer(Node):
             if timestamp < previous:
                 raise ValueError("timestamps must be monotonically increasing")
             previous = timestamp
+
+    @staticmethod
+    def _read_imu(path):
+        if not path.is_file():
+            raise FileNotFoundError(f"IMU file not found: {path}")
+        samples = []
+        for line_number, line in enumerate(path.read_text().splitlines(), 1):
+            fields = line.split()
+            if not fields:
+                continue
+            if len(fields) != 7:
+                raise ValueError(
+                    f"Expected 7 IMU fields at {path}:{line_number}"
+                )
+            values = [float(value) for value in fields]
+            # 4Seasons: timestamp_ns wx wy wz ax ay az.
+            samples.append((values[0] * 1e-9, *values[1:]))
+        if not samples:
+            raise ValueError(f"No IMU samples found in: {path}")
+        return samples
+
+    @staticmethod
+    def _set_stamp(message, timestamp):
+        seconds = int(timestamp)
+        nanoseconds = int(round((timestamp - seconds) * 1e9))
+        if nanoseconds >= 1_000_000_000:
+            seconds += 1
+            nanoseconds -= 1_000_000_000
+        message.header.stamp.sec = seconds
+        message.header.stamp.nanosec = nanoseconds
+
+    def _publish_imu_until(self, timestamp):
+        while (self.imu_index < len(self.imu_samples) and
+               self.imu_samples[self.imu_index][0] <= timestamp):
+            sample_index = self.imu_index
+            sample = self.imu_samples[sample_index]
+            self.imu_index += 1
+            if sample_index % self.imu_decimation:
+                continue
+            message = Imu()
+            self._set_stamp(message, sample[0])
+            message.header.frame_id = self.imu_frame_id
+            message.angular_velocity.x = sample[1]
+            message.angular_velocity.y = sample[2]
+            message.angular_velocity.z = sample[3]
+            message.linear_acceleration.x = sample[4]
+            message.linear_acceleration.y = sample[5]
+            message.linear_acceleration.z = sample[6]
+            message.orientation_covariance[0] = -1.0
+            self.imu_pub.publish(message)
 
     def _start_playback(self):
         self.timer.cancel()
@@ -171,22 +254,24 @@ class KittiDatasetPlayer(Node):
             )
 
         timestamp = self.timestamps[index]
-        seconds = int(timestamp)
-        nanoseconds = int(round((timestamp - seconds) * 1e9))
-        if nanoseconds >= 1_000_000_000:
-            seconds += 1
-            nanoseconds -= 1_000_000_000
+        self._publish_imu_until(timestamp)
 
         encoding = self._encoding_for(left)
         left_msg = self.bridge.cv2_to_imgmsg(left, encoding=encoding)
         right_encoding = self._encoding_for(right)
         right_msg = self.bridge.cv2_to_imgmsg(right, encoding=right_encoding)
         for message in (left_msg, right_msg):
-            message.header.stamp.sec = seconds
-            message.header.stamp.nanosec = nanoseconds
-            message.header.frame_id = self.frame_id
+            self._set_stamp(message, timestamp)
+            # Preserve the original offline dataset index across DDS/ORB frame
+            # drops. The wrapper records it with tracked feature coordinates.
+            message.header.frame_id = f"{self.frame_id}|dataset_frame={index}"
 
+        # Large raw stereo images can otherwise enter DDS back-to-back and
+        # starve one subscription callback.  A small separation preserves the
+        # common timestamp while giving the left sample time to be delivered.
         self.left_pub.publish(left_msg)
+        if self.stereo_publish_gap > 0.0:
+            time.sleep(self.stereo_publish_gap)
         self.right_pub.publish(right_msg)
         self.current += 1
 

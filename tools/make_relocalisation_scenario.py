@@ -22,11 +22,25 @@ def parse_args():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--dropout-start", type=int, default=800)
     parser.add_argument("--dropout-end", type=int, default=814)
+    parser.add_argument(
+        "--no-dropout",
+        action="store_true",
+        help="Do not inject blackout frames; perturb only the natural revisit.",
+    )
     parser.add_argument("--night-start", type=int, default=815)
     parser.add_argument("--night-end", type=int, default=900)
     parser.add_argument("--brightness", type=float, default=-60.0)
     parser.add_argument("--contrast", type=float, default=0.75)
     parser.add_argument("--gamma", type=float, default=0.7)
+    parser.add_argument(
+        "--brightness-scale",
+        type=float,
+        default=None,
+        help=(
+            "Multiply perturbed pixels by this factor (0 < scale <= 1). "
+            "When set, this replaces the brightness/contrast/gamma transform."
+        ),
+    )
     parser.add_argument(
         "--revisit-source-start",
         type=int,
@@ -41,16 +55,20 @@ def parse_args():
 
 
 def validate(args):
-    if args.dropout_start < 0:
+    if not args.no_dropout and args.dropout_start < 0:
         raise ValueError("dropout-start must be non-negative")
-    if args.dropout_end < args.dropout_start:
+    if not args.no_dropout and args.dropout_end < args.dropout_start:
         raise ValueError("dropout-end must be >= dropout-start")
-    if args.night_start <= args.dropout_end:
+    if not args.no_dropout and args.night_start <= args.dropout_end:
         raise ValueError("night-start must be after dropout-end")
     if args.night_end < args.night_start:
         raise ValueError("night-end must be >= night-start")
     if args.gamma <= 0:
         raise ValueError("gamma must be positive")
+    if args.brightness_scale is not None and not (
+        0.0 < args.brightness_scale <= 1.0
+    ):
+        raise ValueError("brightness-scale must be greater than 0 and at most 1")
     if args.revisit_source_start is not None and args.revisit_source_start < 0:
         raise ValueError("revisit-source-start must be non-negative")
 
@@ -60,7 +78,11 @@ def image_paths(directory):
     return sorted(path for path in directory.iterdir() if path.suffix.lower() in allowed)
 
 
-def night_transform(image, brightness, contrast, gamma):
+def night_transform(image, brightness, contrast, gamma, brightness_scale=None):
+    if brightness_scale is not None:
+        return np.clip(
+            image.astype(np.float32) * brightness_scale, 0, 255
+        ).astype(np.uint8)
     adjusted = image.astype(np.float32) * contrast + brightness
     adjusted = np.clip(adjusted, 0, 255).astype(np.uint8)
     lut = np.array(
@@ -104,7 +126,10 @@ def build(args):
     for stereo_dir, paths in (("image_0", left), ("image_1", right)):
         for index, source_image in enumerate(paths):
             destination = output / stereo_dir / source_image.name
-            if args.dropout_start <= index <= args.dropout_end:
+            if (
+                not args.no_dropout
+                and args.dropout_start <= index <= args.dropout_end
+            ):
                 image = cv2.imread(str(source_image), cv2.IMREAD_UNCHANGED)
                 if image is None:
                     raise RuntimeError(f"Could not read {source_image}")
@@ -127,7 +152,11 @@ def build(args):
                 if image is None:
                     raise RuntimeError(f"Could not read {source_image}")
                 image = night_transform(
-                    image, args.brightness, args.contrast, args.gamma
+                    image,
+                    args.brightness,
+                    args.contrast,
+                    args.gamma,
+                    args.brightness_scale,
                 )
                 if not cv2.imwrite(str(destination), image):
                     raise RuntimeError(f"Could not write {destination}")
@@ -137,15 +166,28 @@ def build(args):
 
     shutil.copy2(source / "times.txt", output / "times.txt")
     manifest = {
-        "purpose": "forced tracking loss followed by appearance-changed revisit",
+        "purpose": (
+            "appearance-changed natural revisit"
+            if args.no_dropout
+            else "forced tracking loss followed by appearance-changed revisit"
+        ),
         "source": str(source),
         "frame_count": len(left),
-        "dropout": [args.dropout_start, args.dropout_end],
+        "dropout": (
+            None if args.no_dropout
+            else [args.dropout_start, args.dropout_end]
+        ),
         "night_revisit": [args.night_start, args.night_end],
         "night_parameters": {
             "brightness": args.brightness,
             "contrast": args.contrast,
             "gamma": args.gamma,
+            "brightness_scale": args.brightness_scale,
+            "darkening_percent": (
+                None
+                if args.brightness_scale is None
+                else (1.0 - args.brightness_scale) * 100.0
+            ),
         },
         "revisit_source_start": args.revisit_source_start,
         "modified_stereo_images": modified,

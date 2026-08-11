@@ -150,7 +150,7 @@ def test_disabling_every_layer_is_rejected():
     raise AssertionError("all-disabled configuration should fail")
 
 
-def test_missing_text_is_neutral():
+def test_candidate_missing_query_supported_text_keeps_query_weight():
     model = CognitiveMathModel()
     query_scene = scene([1.0, 0.0])
     candidate_scene = scene([1.0, 0.0])
@@ -165,7 +165,68 @@ def test_missing_text_is_neutral():
         query, candidate, [query_scene], [candidate_scene]
     )
 
-    assert np.isclose(score, 1.0)
+    # Scene and object are perfect, but distinctive query text is absent from
+    # the candidate: (0.3 + 0.3 + 0.4*0) / 1.0.
+    assert np.isclose(score, 0.6)
+
+
+def test_candidate_missing_query_supported_objects_keeps_query_weight():
+    model = CognitiveMathModel(use_text=False)
+    query_scene = scene([1.0, 0.0])
+    candidate_scene = scene([1.0, 0.0])
+    query = keyframe(1, query_scene, [landmark()])
+    candidate = keyframe(2, candidate_scene, [])
+
+    result = model.score_breakdown(
+        query, candidate, [query_scene], [candidate_scene]
+    )
+
+    assert result["object_score"] == 0.0
+    assert np.isclose(result["unified_score"], 0.5)
+
+
+def test_query_without_objects_disables_object_layer_for_all_candidates():
+    model = CognitiveMathModel(use_text=False)
+    query_scene = scene([1.0, 0.0])
+    candidate_scene = scene([1.0, 0.0])
+    query = keyframe(1, query_scene, [])
+    candidate = keyframe(2, candidate_scene, [landmark()])
+
+    result = model.score_breakdown(
+        query, candidate, [query_scene], [candidate_scene]
+    )
+
+    assert result["object_score"] is None
+    assert np.isclose(result["unified_score"], 1.0)
+
+
+def test_garbage_query_ocr_does_not_activate_text_denominator():
+    model = CognitiveMathModel()
+    query_scene = scene([1.0, 0.0])
+    candidate_scene = scene([1.0, 0.0])
+    query_object = landmark(text="]")
+    candidate_object = landmark(text="MAYOWA CAFE 214")
+    query = keyframe(1, query_scene, [query_object])
+    candidate = keyframe(2, candidate_scene, [candidate_object])
+
+    result = model.score_breakdown(
+        query, candidate, [query_scene], [candidate_scene]
+    )
+
+    assert result["text_evidence"] == 0.0
+    assert np.isclose(result["unified_score"], 1.0)
+
+
+def test_disabled_layers_do_not_enter_query_denominator():
+    model = CognitiveMathModel(use_scene=True, use_object=False, use_text=False)
+    query_scene = scene([1.0, 0.0])
+    candidate_scene = scene([1.0, 0.0])
+    query = keyframe(1, query_scene, [landmark()])
+    candidate = keyframe(2, candidate_scene, [])
+
+    assert np.isclose(model.unified_score(
+        query, candidate, [query_scene], [candidate_scene]
+    ), 1.0)
 
 
 def test_changed_storefront_text_is_a_bounded_penalty():
@@ -232,6 +293,31 @@ def test_different_object_classes_are_gated_out():
     ) == 0.0
 
 
+def test_object_confidence_uses_geometric_mean_not_product():
+    model = CognitiveMathModel()
+    query = landmark()
+    candidate = landmark()
+    query.seg_conf = 0.25
+    candidate.seg_conf = 0.64
+
+    assert np.isclose(model.object_match_score(query, candidate), 0.4)
+
+
+def test_object_assignment_is_one_to_one_within_exact_class():
+    model = CognitiveMathModel(sigma_mask=0.1)
+    query = keyframe(1, scene([1.0]), [
+        landmark(name="traffic_sign", x=0.2),
+        landmark(name="traffic_sign", x=0.8),
+    ])
+    candidate = keyframe(2, scene([1.0]), [
+        landmark(name="traffic_sign", x=0.2),
+    ])
+
+    # The single candidate sign can satisfy only one of two query signs;
+    # the unmatched query sign contributes zero.
+    assert np.isclose(model.object_similarity(query, candidate), 0.5)
+
+
 def test_text_requires_geometrically_consistent_supporting_object():
     model = CognitiveMathModel(text_geom_threshold=0.6)
     query = landmark(x=0.1, text="CAFE 214")
@@ -250,12 +336,13 @@ def test_string_similarity_normalises_case_and_punctuation():
     )
 
 
-def test_recovery_policy_requires_both_conditions():
-    model = CognitiveMathModel(semantic_threshold=0.75)
+def test_recovery_policy_requires_both_conditions_and_strict_threshold():
+    model = CognitiveMathModel(semantic_threshold=0.76)
 
     assert model.should_trigger_semantic_recovery(10, 30, 0.90)
     assert not model.should_trigger_semantic_recovery(40, 30, 0.90)
     assert not model.should_trigger_semantic_recovery(10, 30, 0.70)
+    assert not model.should_trigger_semantic_recovery(10, 30, 0.76)
 
 
 def test_candidate_selection_returns_highest_scoring_record():
