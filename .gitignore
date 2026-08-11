@@ -49,4 +49,8 @@ weights/*.engine
 weights/*.engine.json
 weights/*.onnx
 weights/*.pt
+weights/**/*.engine
+weights/**/*.onnx
+weights/**/*.pt
+weights/**/*.ckpt
 yolo*.pt
